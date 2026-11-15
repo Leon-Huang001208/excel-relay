@@ -66,6 +66,6 @@ excel-relay run '<source_id>' --json
 uv build --offline --wheel
 ```
 
-## 来源与许可
+## 许可证
 
-Excel Relay 基于 `cjxl 0.1.0` 发布包开发，采用 [MIT 许可证](LICENSE)。
+Excel Relay 采用 [MIT 许可证](LICENSE)。
