@@ -1,0 +1,41 @@
+[build-system]
+requires = ["uv_build>=0.11.32,<0.12.0"]
+build-backend = "uv_build"
+
+[project]
+name = "excel-relay"
+version = "0.1.0"
+description = "通过 CLI 和 MCP 管理和计算 Excel 底稿"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["ai-agent", "excel", "fintech", "investment-research", "mcp", "wind"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "mcp>=1.0.0,<2",
+    "openpyxl>=3.1.2",
+    "pydantic>=2.0.0",
+    "pywin32>=306; sys_platform == 'win32'",
+    "rich>=13.0.0",
+    "typer>=0.12.0",
+    "xlrd>=2.0.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0"]
+
+[project.scripts]
+excel-relay = "excel_relay.interface.cli:app"
+
+[tool.uv.build-backend]
+module-name = "excel_relay"
+module-root = ""
