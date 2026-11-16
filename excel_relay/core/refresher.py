@@ -37,6 +37,10 @@ class RefreshError(Exception):
     pass
 
 
+class RefreshBusyError(RefreshError):
+    """后台 Excel 正在使用，或尚未确认已安全退出。"""
+
+
 class ExcelComSession:
     """Windows Win32 COM Excel 独立进程会话上下文管理器.
 
@@ -440,6 +444,22 @@ class HeadlessExcelRefresher:
         keep_formulas: bool = False,
         catalog_mgr: Optional[CatalogManager | CascadingCatalog] = None,
     ) -> Tuple[str, float, Optional[RunArtifact]]:
+        """刷新已注册底稿并保留原有三元组接口。"""
+        path, elapsed, artifact, _ = cls.refresh_with_outputs(
+            source_id_or_path, params, output_path, timeout_sec, keep_formulas, catalog_mgr
+        )
+        return path, elapsed, artifact
+
+    @classmethod
+    def refresh_with_outputs(
+        cls,
+        source_id_or_path: str | Path,
+        params: Optional[Dict[str, Any]] = None,
+        output_path: Optional[str | Path] = None,
+        timeout_sec: int = 120,
+        keep_formulas: bool = False,
+        catalog_mgr: Optional[CatalogManager | CascadingCatalog] = None,
+    ) -> Tuple[str, float, Optional[RunArtifact], Optional[List[Dict[str, Any]]]]:
         """刷新已注册的 Excel 数据源，并更新目录或记录计算产物。
 
         macOS 使用桌面 Excel 刷新 Wind .xlsx 底稿，每次生成保留公式的结果副本。
@@ -454,7 +474,7 @@ class HeadlessExcelRefresher:
            - 在 core 层直接调用 mgr.record_artifact() 完成 catalog.json 的唯一覆盖更新 (Upsert)。
 
         Returns:
-            Tuple[落盘文件绝对路径, 耗时秒数, RunArtifact对象(若原地刷新则为None)]
+            落盘路径、耗时、沙箱产物记录，以及本次读取的登记指标。
         """
         if sys.platform == "win32":
             # 与 Windows 原流程一致，在创建副本前验证 COM 依赖。
@@ -489,6 +509,8 @@ class HeadlessExcelRefresher:
         vendors = {vendor.strip() for vendor in entry.physical.vendor.split(",")}
         if sys.platform == "darwin" and (src.suffix.lower() != ".xlsx" or "ifind" in vendors):
             raise RefreshError("macOS 刷新支持 Excel 与 Wind 加载项使用的 .xlsx 底稿。")
+        if sys.platform == "darwin":
+            return cls._refresh_macos(mgr, entry, src, params, output_path, timeout_sec)
 
         allowed_inputs = entry.inputs
 
@@ -501,9 +523,6 @@ class HeadlessExcelRefresher:
         resolved_params: List[Tuple[ParameterDef, Any]] = []
         if params:
             resolved_params = cls.validate_and_resolve_params(params, allowed_inputs)
-
-        if sys.platform == "darwin":
-            return cls._refresh_macos(mgr, entry, src, params, resolved_params, output_path, timeout_sec)
 
         # 决定运行模式：带参模型 f(t, X) 或显式指定 output_path 时一律走沙箱副本
         has_declared_inputs = bool(allowed_inputs)
@@ -651,7 +670,7 @@ class HeadlessExcelRefresher:
                 source_id_or_path=entry.source_id,
             )
 
-        return str(work_file), elapsed, artifact
+        return str(work_file), elapsed, artifact, None
 
     @classmethod
     def _refresh_macos(
@@ -660,14 +679,30 @@ class HeadlessExcelRefresher:
         entry: SourceEntry,
         src: Path,
         params: Optional[Dict[str, Any]],
-        resolved_params: List[Tuple[ParameterDef, Any]],
         output_path: Optional[str | Path],
         timeout_sec: int,
-    ) -> Tuple[str, float, RunArtifact]:
-        from excel_relay.core.macos_excel import excel_refresh_lock, refresh_xlsx
+    ) -> Tuple[str, float, RunArtifact, Optional[List[Dict[str, Any]]]]:
+        from excel_relay.core.contracts import (
+            get_source_contract,
+            normalize_contract_params,
+            read_contract_outputs,
+        )
+        from excel_relay.core.macos_excel import (
+            ExcelBusyError,
+            WorkerCleanupError,
+            excel_refresh_lock,
+            refresh_xlsx,
+        )
 
         try:
             with excel_refresh_lock():
+                contract = get_source_contract(mgr, entry)
+                if contract is not None:
+                    params = normalize_contract_params(src, entry, params, contract)
+                if entry.inputs:
+                    ExcelInspector.refresh_input_values(src, entry.inputs)
+                resolved_params = cls.validate_and_resolve_params(params, entry.inputs) if params else []
+
                 if output_path is None:
                     full_params = cls.build_full_params(params, entry.inputs)
                     artifact_id = compute_artifact_id(entry.source_id, compute_params_hash(full_params))
@@ -687,11 +722,13 @@ class HeadlessExcelRefresher:
                 with tempfile.NamedTemporaryFile(prefix="excel-relay-", suffix=".xlsx", dir=dst.parent, delete=False) as stage:
                     stage_path = Path(stage.name)
                 backup = stage_path.with_suffix(".previous")
+                preserve_stage = False
                 try:
                     shutil.copyfile(src, stage_path)
                     start_time = time.monotonic()
                     refresh_xlsx(stage_path, resolved_params, timeout_sec)
                     elapsed = round(time.monotonic() - start_time, 2)
+                    outputs = read_contract_outputs(stage_path, contract) if contract and contract.outputs else None
 
                     try:
                         if dst.is_file():
@@ -722,12 +759,17 @@ class HeadlessExcelRefresher:
                         raise
                     else:
                         backup.unlink(missing_ok=True)
+                except WorkerCleanupError as exc:
+                    preserve_stage = True
+                    raise RefreshError(f"{exc}。已保留待恢复的副本：{stage_path}") from exc
                 finally:
-                    stage_path.unlink(missing_ok=True)
-        except (OSError, RuntimeError) as exc:
+                    if not preserve_stage:
+                        stage_path.unlink(missing_ok=True)
+                return str(dst), elapsed, artifact, outputs
+        except ExcelBusyError as exc:
+            raise RefreshBusyError(str(exc)) from exc
+        except (OSError, RuntimeError, ValueError) as exc:
             raise RefreshError(f"macOS Excel 刷新失败: {exc}") from exc
-
-        return str(dst), elapsed, artifact
 
     @staticmethod
     def _strip_formulas(wb) -> None:

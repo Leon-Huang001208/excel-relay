@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -24,6 +25,10 @@ from excel_relay.core import (
     get_version as core_get_version,
     get_version_info,
 )
+from excel_relay.core.contracts import OutputContract
+from excel_relay.core.contracts import configure_source_contract as configure_contract
+from excel_relay.core.contracts import get_source_contract
+from excel_relay.core.refresher import RefreshBusyError
 
 logger = logging.getLogger("excel-relay.mcp")
 
@@ -35,7 +40,7 @@ MCP_INSTRUCTIONS = """[Excel Relay安全与操作守则]
 所有通过 excel-relay 处理投研数据的任务，必须严格遵循以下三步线性闭环，严禁跳步或直接读取需动态刷新的母版原文件：
 1. 第一步【查找定位】：优先调用 search_data_sources 检索目标底稿与参数契约，获取 source_id、外部插件依赖状态 (has_plugin_dependency) 及已登记输入参数清单 (inputs)。
 2. 第二步【刷新/带参计算】：调用 refresh_data_source 驱动真实 Excel 后台刷新或带参计算（若含万得/同花顺插件或需最新动态数据则无参刷新；若需传入查询参数提取特定数据或调整假设测算，则传入白名单 params 在沙箱副本中计算）。严禁跳过本步直接读取需动态计算的原文件！
-3. 第三步【自主读取与交付】：等待第二步返回物理结果文件 (result_file_path) 后，使用你自身的文件读取/Python 能力打开该结果文件，按用户实际意图提取目标数据或交付分析报告（若仅是函数式传参取数，直接交付数据即可，无需做多余的敏感性对比）。
+3. 第三步【结果交付】。已登记的指标从 outputs 直接取得，逐项核对状态、单位和单元格。用户需要其他数据时，从 result_file_path 指向的本次结果文件读取。
 
 macOS 使用桌面 Excel 与 Wind 加载项刷新 .xlsx，结果保存为保留公式的副本。
 
@@ -131,11 +136,14 @@ def get_source_detail(source_id: str, workspace_path: Optional[str] = None) -> s
         else "该底稿无外部插件依赖。若需调整参数测算请调 refresh_data_source，若仅查询历史静态数据可直接读取 resolved_absolute_path。"
     )
     data["resolved_absolute_path"] = str(cascading.resolve_absolute_path(entry))
+    contract = get_source_contract(cascading, entry)
+    if contract is not None:
+        data["contract"] = contract.model_dump()
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
-def refresh_data_source(
+async def refresh_data_source(
     source_id: str,
     params: Optional[Dict[str, Any]] = None,
     output_path: Optional[str] = None,
@@ -152,23 +160,37 @@ def refresh_data_source(
     - params 的键必须严格对应已登记参数的 name 或 cell 坐标，未登记参数的数据源仅支持无参刷新；
     - 若传参被白名单拦截，严禁私自调用 configure_source_inputs 修改白名单，必须向用户报告当前允许的参数范围并询问用户；
     - 产物副本将自动写入所属仓储的沙箱目录 (项目专属底稿存入项目 .excel-relay/artifacts/)；
-    - 计算完成后，本工具返回结果文件物理路径 (result_file_path)，请务必使用你自身的 Excel/Python 读取能力打开该文件读取结果。
+    - 计算完成后返回结果文件路径 (result_file_path)。已登记的指标直接返回在 outputs 中，并附本次刷新时间 (refreshed_at)。
+    - macOS 后台已有刷新时返回 status=busy。
 
     Args:
         source_id: 数据源唯一 ID (支持完整 ID 或前 6 位短 Hash)
-        params: 拟传入的参数字典，如 {"证券代码": "600519.SH"}、{"提价幅度": 5} 或 {"假设表!C4": 5}
+        params: 拟传入的参数字典。已声明的日期参数接受 YYYY-MM-DD 或 Excel 序列值。
         output_path: 可选另存路径。macOS 未指定时自动生成独立结果路径。
         timeout_sec: 刷新超时秒数，默认 120。Windows 在插件持续返回数据时可顺延。
         keep_formulas: Windows 副本是否保留公式，默认为 False。macOS 副本始终保留公式。
         workspace_path: 可选工作区路径，用于定位项目专属数据源
     """
+    return await asyncio.to_thread(
+        _refresh_data_source, source_id, params, output_path, timeout_sec, keep_formulas, workspace_path
+    )
+
+
+def _refresh_data_source(
+    source_id: str,
+    params: Optional[Dict[str, Any]],
+    output_path: Optional[str],
+    timeout_sec: int,
+    keep_formulas: bool,
+    workspace_path: Optional[str],
+) -> str:
     cascading = get_cascading_catalog(workspace_or_cwd=workspace_path)
     entry = cascading.get_source(source_id)
     if not entry:
         return f"错误: 未找到 ID 为 '{source_id}' 的数据源。"
 
     try:
-        out_file, elapsed, run_artifact = HeadlessExcelRefresher.refresh(
+        out_file, elapsed, run_artifact, outputs = HeadlessExcelRefresher.refresh_with_outputs(
             source_id_or_path=entry.source_id,
             params=params,
             output_path=output_path,
@@ -189,10 +211,19 @@ def refresh_data_source(
             "params_hash": run_artifact.params_hash if run_artifact else "base",
             "keep_formulas": run_artifact.keep_formulas if run_artifact else True,
             "elapsed_seconds": elapsed,
-            "message": f"成功在后台刷新数据！耗时 {elapsed} 秒，结果文件已保存至 {out_file}，请直接读取该 Excel 文件获取完整计算结果。",
+            "message": f"成功在后台刷新数据！耗时 {elapsed} 秒，结果文件已保存至 {out_file}。",
         }
+        if outputs is not None:
+            payload["outputs"] = outputs
+            payload["refreshed_at"] = run_artifact.created_at if run_artifact else None
 
         return json.dumps(payload, ensure_ascii=False, indent=2)
+    except RefreshBusyError as error:
+        return json.dumps({
+            "status": "busy",
+            "source_id": entry.source_id,
+            "error": str(error),
+        }, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error("刷新数据源异常 (%s): %s", entry.source_id, e)
         return json.dumps({
@@ -433,6 +464,44 @@ def configure_source_inputs(
         "scope": entry.scope.value,
         "inputs": [i.model_dump() for i in entry.inputs],
         "message": f"成功为数据源 {entry.source_id} ({entry.scope.value}) 配置 {len(entry.inputs)} 个可调输入参数！",
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def configure_source_contract(
+    source_id: str,
+    date_inputs: List[str],
+    outputs: List[OutputContract],
+    workspace_path: Optional[str] = None,
+) -> str:
+    """为当前项目中已登记的底稿设置日期参数类型和固定指标。
+
+    Args:
+        source_id: 项目底稿 ID 或已登记的文件路径。
+        date_inputs: 已登记的日期参数名称列表。
+        outputs: 固定指标定义列表。每项包含 name、cell 和 unit，cell 采用 Sheet!A1 格式。
+        workspace_path: 底稿所在的项目工作区路径。
+    """
+    try:
+        cascading = get_cascading_catalog(workspace_or_cwd=workspace_path)
+        entry = cascading.get_source(source_id)
+        if entry is None:
+            raise ValueError(f"未找到对应数据源 {source_id}。")
+        contract = configure_contract(
+            cascading, entry.source_id, {"date_inputs": date_inputs, "outputs": outputs}
+        )
+    except Exception as error:
+        logger.error("登记底稿指标失败 (%s): %s", source_id, error)
+        return json.dumps({
+            "status": "error",
+            "source_id": source_id,
+            "error": str(error),
+        }, ensure_ascii=False, indent=2)
+    return json.dumps({
+        "status": "success",
+        "source_id": entry.source_id,
+        "scope": "project",
+        "contract": contract.model_dump(),
     }, ensure_ascii=False, indent=2)
 
 

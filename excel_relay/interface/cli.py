@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import List, Optional
 
@@ -30,6 +31,8 @@ from excel_relay.core import (
     get_version_info,
     is_sensitive_dir,
 )
+from excel_relay.core.contracts import configure_source_contract
+from excel_relay.core.refresher import RefreshBusyError
 from excel_relay.interface.menu import (
     DIR_SUB_MENU_ITEMS,
     SUB_MENU_ITEMS,
@@ -518,9 +521,12 @@ def set_source_metadata(
         "-i",
         help="登记可调输入参数坐标，如 -i '提价幅度=假设表!C4 (单位%)' 或 -i '假设表!C4'",
     ),
+    contract_file: Optional[Path] = typer.Option(
+        None, "--contract", help="读取项目底稿的日期参数和固定指标定义 JSON 文件。"
+    ),
     json_output: bool = typer.Option(False, "--json", help="以 JSON 格式输出更新后的数据源信息。"),
 ):
-    """为数据源补充业务语义画像或显式登记可调参数契约 (自动路由至其归属仓)."""
+    """补充数据源语义、登记输入参数或配置项目输出指标。"""
     cascading = get_cascading_catalog()
     entry = cascading.get_source(source_id)
     if not entry:
@@ -531,6 +537,20 @@ def set_source_metadata(
         raise typer.Exit(1)
 
     has_profile_updates = any(v is not None for v in (name, summary, tag, question, notes))
+    contract = None
+    if contract_file is not None:
+        try:
+            if has_profile_updates or input_def is not None:
+                raise ValueError("请先完成数据源或输入参数的更新，再单独登记指标配置。")
+            spec = json.loads(contract_file.read_text(encoding="utf-8"))
+            contract = configure_source_contract(cascading, entry.source_id, spec)
+        except Exception as error:
+            if json_output:
+                print(json.dumps({"status": "error", "error": str(error)}, ensure_ascii=False, indent=2))
+            else:
+                console.print(f"登记底稿指标失败。{error}", style="bold red", markup=False)
+            raise typer.Exit(1)
+
     if has_profile_updates:
         entry = cascading.update_source(
             source_id=source_id,
@@ -557,7 +577,7 @@ def set_source_metadata(
 
     if json_output:
         abs_p = cascading.resolve_absolute_path(entry)
-        print(json.dumps({
+        payload = {
             "status": "success",
             "source_id": entry.source_id,
             "scope": entry.scope.value,
@@ -572,7 +592,10 @@ def set_source_metadata(
             "inputs": [i.model_dump() for i in entry.inputs],
             "file_path": entry.file_path,
             "absolute_path": str(abs_p),
-        }, ensure_ascii=False, indent=2))
+        }
+        if contract is not None:
+            payload["contract"] = contract.model_dump()
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 
     scope_name = "【项目专属】" if entry.scope == CatalogScope.PROJECT else "【用户全局】"
@@ -585,6 +608,8 @@ def set_source_metadata(
     if entry.inputs:
         in_desc = ", ".join([f"{i.name}({i.cell}={i.current_value})" for i in entry.inputs])
         console.print(f"已登记输入参数: [yellow]{in_desc}[/yellow]")
+    if contract is not None:
+        console.print(f"已登记 {len(contract.outputs)} 项固定指标。")
 
 
 @app.command(name="rm")
@@ -718,7 +743,7 @@ def _parse_cli_params(params_raw: Optional[List[str]]) -> Optional[dict]:
 def run_refresh(
     source_id_or_file: str = typer.Argument(..., help="已注册的数据源 ID (或前6位短Hash) 或文件路径"),
     params: Optional[List[str]] = typer.Option(
-        None, "--param", "-p", help="已登记参数赋值，如 -p 提价幅度=5 或 -p 假设表!C4=5"
+        None, "--param", "-p", help="已登记参数赋值。已声明的日期参数接受 YYYY-MM-DD 或 Excel 序列值。"
     ),
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="另存为输出文件路径"),
     timeout: int = typer.Option(120, "--timeout", "-t", help="刷新超时秒数，Windows 在插件持续返回数据时可顺延"),
@@ -759,8 +784,13 @@ def run_refresh(
             console.print(f"产物策略: {mode_text}")
 
     try:
-        if json_output:
-            out_path, elapsed, artifact = HeadlessExcelRefresher.refresh(
+        status_display = (
+            nullcontext()
+            if json_output
+            else console.status("[bold green]Excel 正在后台计算中，请稍候...[/bold green]")
+        )
+        with status_display:
+            out_path, elapsed, artifact, outputs = HeadlessExcelRefresher.refresh_with_outputs(
                 source_id_or_path=entry.source_id,
                 params=param_dict,
                 output_path=output,
@@ -768,19 +798,16 @@ def run_refresh(
                 keep_formulas=keep_formulas,
                 catalog_mgr=cascading,
             )
-        else:
-            with console.status("[bold green]Excel 正在后台计算中，请稍候..."):
-                out_path, elapsed, artifact = HeadlessExcelRefresher.refresh(
-                    source_id_or_path=entry.source_id,
-                    params=param_dict,
-                    output_path=output,
-                    timeout_sec=timeout,
-                    keep_formulas=keep_formulas,
-                    catalog_mgr=cascading,
-                )
     except RefreshError as re_err:
+        busy = isinstance(re_err, RefreshBusyError)
         if json_output:
-            print(json.dumps({"status": "error", "source_id": entry.source_id, "error": str(re_err)}, ensure_ascii=False, indent=2))
+            print(json.dumps({
+                "status": "busy" if busy else "error",
+                "source_id": entry.source_id,
+                "error": str(re_err),
+            }, ensure_ascii=False, indent=2))
+        elif busy:
+            console.print(f"Excel Relay 忙碌。{re_err}", style="yellow", markup=False)
         else:
             console.print(f"[bold red]刷新被拦截或失败:[/bold red] {re_err}")
         raise typer.Exit(1)
@@ -804,6 +831,9 @@ def run_refresh(
             "keep_formulas": artifact.keep_formulas if artifact else True,
             "elapsed_seconds": elapsed,
         }
+        if outputs is not None:
+            payload["outputs"] = outputs
+            payload["refreshed_at"] = artifact.created_at if artifact else None
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 

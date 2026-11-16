@@ -10,7 +10,7 @@ import platform
 import sys
 from typing import Any, Dict
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 CATALOG_PROTOCOL_VERSION = "0.1.0"
 
 

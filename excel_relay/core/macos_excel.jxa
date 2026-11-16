@@ -1,0 +1,236 @@
+ObjC.import("Foundation");
+ObjC.import("AppKit");
+
+const descriptor = $.NSAppleEventDescriptor;
+const excelId = "com.microsoft.Excel";
+const pendingValue = /^(?:#|$)|fetch|请求中|获取中/i;
+
+function fourCC(text) {
+    return Array.from(text).reduce((code, char) => code * 256 + char.charCodeAt(0), 0);
+}
+
+function objectSpecifier(type, form, key, parent = descriptor.nullDescriptor) {
+    const record = descriptor.recordDescriptor;
+    const fields = {
+        want: descriptor.descriptorWithTypeCode(fourCC(type)),
+        form: descriptor.descriptorWithEnumCode(fourCC(form)),
+        seld: key,
+        from: parent,
+    };
+    for (const [name, value] of Object.entries(fields)) {
+        record.setDescriptorForKeyword(value, fourCC(name));
+    }
+    return record.coerceToDescriptorType(fourCC("obj "));
+}
+
+function property(code, parent) {
+    return objectSpecifier("prop", "prop", descriptor.descriptorWithTypeCode(fourCC(code)), parent);
+}
+
+function named(type, name, parent) {
+    return objectSpecifier(type, "name", descriptor.descriptorWithString(name), parent);
+}
+
+function all(type, parent) {
+    return objectSpecifier(type, "indx", descriptor.descriptorWithEnumCode(fourCC("all ")), parent);
+}
+
+function valueOf(value) {
+    if (!value || value.isNil() || value.descriptorType === fourCC("msng")) return null;
+    if (value.descriptorType === fourCC("list")) {
+        return Array.from({length: value.numberOfItems}, (_, i) => valueOf(value.descriptorAtIndex(i + 1)));
+    }
+    if (value.descriptorType === fourCC("bool")) return Boolean(value.booleanValue);
+    return ObjC.unwrap(value.stringValue);
+}
+
+function send(pid, suite, command, fields, timeout) {
+    const event = descriptor.appleEventWithEventClassEventIDTargetDescriptorReturnIDTransactionID(
+        fourCC(suite), fourCC(command), descriptor.descriptorWithProcessIdentifier(pid), -1, 0);
+    for (const [name, value] of Object.entries(fields)) {
+        event.setParamDescriptorForKeyword(value, fourCC(name));
+    }
+    const error = Ref();
+    const reply = event.sendEventWithOptionsTimeoutError(3, timeout, error);
+    if (!reply || reply.isNil()) {
+        throw new Error(ObjC.unwrap(error[0].localizedDescription));
+    }
+    const problem = reply.paramDescriptorForKeyword(fourCC("errn"));
+    if (problem && !problem.isNil() && problem.int32Value) {
+        throw new Error(problem.int32Value + " " + valueOf(reply.paramDescriptorForKeyword(fourCC("errs"))));
+    }
+    return valueOf(reply.paramDescriptorForKeyword(fourCC("----")));
+}
+
+function snapshot() {
+    const apps = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(excelId);
+    const result = [];
+    for (let index = 0; index < apps.count; index++) {
+        const app = apps.objectAtIndex(index);
+        if (!app.terminated && !app.launchDate.isNil()) {
+            result.push({pid: app.processIdentifier, started: app.launchDate.timeIntervalSince1970});
+        }
+    }
+    return result;
+}
+
+function worker(data) {
+    const app = $.NSRunningApplication.runningApplicationWithProcessIdentifier(data.pid);
+    if (!app || app.isNil() || app.terminated) return null;
+    if (ObjC.unwrap(app.bundleIdentifier) !== excelId ||
+        app.launchDate.timeIntervalSince1970 !== data.started) {
+        throw new Error("Excel 进程身份不一致。");
+    }
+    return app;
+}
+
+function run(argv) {
+    if (argv[0] === "snapshot") return JSON.stringify(snapshot());
+    const data = JSON.parse(ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(
+        argv[1], $.NSUTF8StringEncoding, null)));
+    const mode = argv[0];
+    const app = worker(data);
+    if (mode === "cleanup" && !app) return JSON.stringify({status: "exited"});
+    if (!app) throw new Error("任务 Excel 实例已退出。");
+
+    const start = Date.now();
+    const deadline = start + data.seconds * 1000;
+    // These class and property codes come from Microsoft Excel's scripting dictionary.
+    const workbook = named("X141", data.path.split("/").pop());
+    const sheet = name => named("XwSH", name, workbook);
+    const cell = (sheetName, address) => named("X117", address, sheet(sheetName));
+    const command = (suite, verb, fields = {}) => {
+        const remaining = (deadline - Date.now()) / 1000;
+        if (remaining <= 0) throw new Error("Excel 操作超时。");
+        if (!worker(data)) throw new Error("任务 Excel 实例已退出。");
+        return send(data.pid, suite, verb, fields, remaining);
+    };
+    const get = (name, parent) => command("core", "getd", {"----": property(name, parent)});
+    const set = (name, parent, newValue) => command("core", "setd", {
+        "----": property(name, parent), data: newValue,
+    });
+    const books = () => get("1773", all("X141")) || [];
+    const assertOwned = () => {
+        const paths = books();
+        if (paths.length !== 1 || paths[0] !== data.path) {
+            throw new Error("任务实例未独占本次计算副本。");
+        }
+    };
+    // Let AppKit deliver visibility and launch-state updates between polls.
+    const pause = seconds => $.NSRunLoop.currentRunLoop.runUntilDate(
+        $.NSDate.dateWithTimeIntervalSinceNow(seconds));
+    const hide = () => {
+        if (app.hidden) return;
+        app.hide;
+        const until = Math.min(deadline, Date.now() + 2000);
+        while (!app.hidden && Date.now() < until) pause(0.1);
+        if (!app.hidden) throw new Error("无法确认任务 Excel 实例已隐藏。");
+    };
+
+    if (mode === "cleanup") {
+        const openPaths = books();
+        if ((!data.owned && !openPaths.includes(data.path)) ||
+            openPaths.some(path => path !== data.path)) {
+            throw new Error("任务进程存在未归属本次刷新的工作簿。");
+        }
+        if (openPaths.includes(data.path)) {
+            command("core", "clos", {"----": workbook, savo: descriptor.descriptorWithEnumCode(fourCC("no  "))});
+        }
+        if (books().length) throw new Error("退出前检测到仍有工作簿打开。");
+        try {
+            command("aevt", "quit");
+        } catch (error) {
+            if (worker(data)) throw error;
+        }
+        return JSON.stringify({status: "closed"});
+    }
+
+    if (mode === "open") {
+        let lastError = "";
+        while (Date.now() < deadline) {
+            try {
+                if (books().includes(data.path)) break;
+            } catch (error) {
+                lastError = String(error);
+            }
+            pause(0.2);
+        }
+        if (Date.now() >= deadline) throw new Error("任务 Excel 未能打开副本。" + lastError);
+        assertOwned();
+        hide();
+        if (get("1830", workbook)) throw new Error("Excel 以只读方式打开计算副本。");
+        return JSON.stringify({status: "opened", elapsed_ms: Date.now() - start});
+    }
+
+    assertOwned();
+    hide();
+    if (mode === "prepare") {
+        const calculation = [];
+        for (const name of get("pnam", all("XwSH", workbook))) {
+            if (name === "_excel_relay") continue;
+            const target = sheet(name);
+            calculation.push([name, get("1733", target)]);
+        }
+        for (const [name, address, kind, raw] of data.params) {
+            const range = cell(name, address);
+            if (kind === "empty") {
+                command("smXL", "1531", {"----": range});
+            } else {
+                let argument;
+                if (kind === "number") argument = descriptor.descriptorWithDouble(Number(raw));
+                else if (kind === "boolean") argument = descriptor.descriptorWithBoolean(raw === "true");
+                else argument = descriptor.descriptorWithString("'" + raw);
+                set("DPVu", range, argument);
+            }
+        }
+        return JSON.stringify({status: "prepared", calculation});
+    }
+    if (mode === "refresh") {
+        assertOwned();
+        if (data.wind) {
+            command("smXL", "2620", {
+                "----": descriptor.descriptorWithString("'windfunc.xlam'!windexcel_ui.clear_cache_data"),
+            });
+        }
+        for (const [name] of data.calculation) {
+            const target = sheet(name);
+            set("1733", target, descriptor.descriptorWithBoolean(false));
+            set("1733", target, descriptor.descriptorWithBoolean(true));
+            command("smXL", "1175", {"----": target});
+        }
+        return JSON.stringify({status: "requested", calculate_ms: Date.now() - start});
+    }
+    if (mode !== "settle") throw new Error("未知 Excel 后台操作。");
+
+    if (data.wind) {
+        // Wind's own recalculation callbacks select Excel by bundle ID.
+        // Once this worker receives its responses, recalculate its cache by PID.
+        assertOwned();
+        command("smXL", "1338");
+    }
+    let previous = null;
+    let stable = 0;
+    while (data.watches.length && stable < 2) {
+        const reading = data.watches.map(([name, address]) => get("DPVu", cell(name, address)));
+        const pending = reading.reduce((count, value) =>
+            count + Number(value == null || pendingValue.test(String(value))), 0);
+        if (pending) return JSON.stringify({status: "pending", settle_ms: Date.now() - start});
+        const signature = JSON.stringify(reading);
+        stable = signature === previous ? stable + 1 : 0;
+        previous = signature;
+        if (stable < 2) pause(0.5);
+    }
+    const ready = Date.now();
+    assertOwned();
+    for (const [name, wasEnabled] of data.calculation) {
+        if (!wasEnabled) set("1733", sheet(name), descriptor.descriptorWithBoolean(false));
+    }
+    hide();
+    command("core", "save", {"----": workbook});
+    if (!get("1842", workbook)) throw new Error("Excel 未确认保存计算副本。");
+    return JSON.stringify({
+        status: "saved",
+        settle_ms: ready - start,
+        save_ms: Date.now() - ready,
+    });
+}
